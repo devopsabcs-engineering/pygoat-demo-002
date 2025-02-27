@@ -1,0 +1,16 @@
+.env/
+*.pyc
+env
+pygoat/db.sqlite3
+venv
+*.sqlite3
+*db.sqlite3*
+app.log
+bin
+/data/db
+/.vs
+pygoatvenv/
+.env.local
+tmp/audit
+tmp/dry-run
+tmp/migrate

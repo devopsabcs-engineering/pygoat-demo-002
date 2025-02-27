@@ -1,0 +1,255 @@
+name: OWASP_PyGoat_ci_cd
+on:
+  workflow_dispatch:
+    inputs:
+      deployInfra:
+        default: true
+        type: boolean
+        required: false
+      subscriptionName:
+        default: OWASP_IT Test
+        type: string
+        required: false
+      baseName:
+        default: gh-pygoat
+        type: string
+        required: false
+      imageName:
+        default: gh-pygoat
+        type: string
+        required: false
+      location:
+        description: "Azure location to deploy to"
+        required: true
+        default: "canadacentral"
+        type: choice
+        options:
+          - westeurope
+          - eastus
+          - eastus2
+          - westus
+          - centralus
+          - northcentralus
+          - southcentralus
+          - canadacentral
+          - canadaeast
+          - uksouth
+          - ukwest
+      environmentName:
+        description: "Environment to deploy to"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      instanceNumber:
+        default: "006"
+        type: string
+        required: false
+      teardown:
+        description: Should teardown infrastructure?
+        default: false
+        type: boolean
+        required: true
+  push:
+    branches:
+      - master
+      - "!features/experimental/*"
+    paths:
+      - Dockerfile
+      - ".azuredevops/pipelines/main-ci-cd.yml"
+      - infra/bicep/appservice/main.bicep
+      - "!README.md"
+
+env:
+  addAzureAdAppSettings: false
+  azureSubscription: "${{ inputs.subscriptionName }}"
+  baseName: ${{ inputs.baseName }}-${{ inputs.environmentName }}-${{ inputs.instanceNumber }}
+  deployInfra: ${{ inputs.deployInfra }}
+  deploymentName: infra-deployment
+  dockerfilePath: "${{ github.workspace }}/Dockerfile"
+  environmentName: ${{ inputs.environmentName }}-${{ inputs.instanceNumber }}
+  imageName: ${{ inputs.imageName }}
+  location: ${{ inputs.location }}
+  resourceGroupName: rg-${{ inputs.baseName }}-${{ inputs.environmentName }}-${{ inputs.instanceNumber }}
+  templateFile: "${{ github.workspace }}/infra/bicep/appservice/main.bicep"
+  workingDirectory: "${{ github.workspace }}"
+  workingDirectoryDockerContext: "${{ github.workspace }}"
+
+permissions:
+  id-token: write # This is required for requesting the JWT to login to Azure with GitHub Actions and federate identity
+  contents: read
+
+# federate identity needed:
+# repo:devopsabcs-engineering/pygoat:ref:refs/heads/master
+# repo:devopsabcs-engineering/pygoat:environment:dev-006
+# repo:devopsabcs-engineering/pygoat:environment:dev-006_DESTROYED
+# repo:devopsabcs-engineering/pygoat:environment:dev-007
+# repo:devopsabcs-engineering/pygoat:environment:dev-007_DESTROYED
+# and so on
+
+jobs:
+  set_version-set_version:
+    name: Set version
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.teardown != 'true' }}
+    # Permission can be added at job level or workflow level
+    permissions:
+      id-token: write #This is required for requesting the JWT
+      contents: write # This is required to create/push the new git tag
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v3
+        with:
+          versionSpec: "5.x"
+      - name: Determine Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v3
+      - name: Display GitVersion outputs
+        run: |
+          echo "SemVer: ${{ steps.gitversion.outputs.semVer }}"
+      - name: Create or update tag
+        uses: actions/github-script@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+        with:
+          script: |
+            const tagName = `v${{ steps.gitversion.outputs.semVer }}`;
+            const ref = `refs/tags/${tagName}`;
+            const { data: refs } = await github.git.listMatchingRefs({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `tags/${tagName}`
+            });
+            if (refs.length > 0) {
+              await github.git.updateRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tagName}`,
+                sha: context.sha,
+                force: true
+              });
+            } else {
+              await github.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: ref,
+                sha: context.sha
+              });
+            }
+  deployInfra-deploy:
+    name: Deploy Infra job
+    needs:
+      - set_version-set_version
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environmentName }}-${{ inputs.instanceNumber }}
+    if: success() && ${{ github.event.inputs.deployInfra == 'true' }} && ${{ github.event.inputs.teardown != 'true' }}
+    permissions:
+      id-token: write # This is required for requesting the JWT to login to Azure with GitHub Actions and federate identity
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: download artifact
+        uses: actions/download-artifact@v4
+      - name: Azure CLI Login ${{ env.azureSubscription }} - deployInfra
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy Infra to ${{ env.azureSubscription }}
+        run: |-
+          echo "Deploying to Azure"
+          az group create --name ${{ env.resourceGroupName }} \
+              --location ${{ env.location }}
+          az deployment group create --name ${{ env.deploymentName }} \
+              --resource-group ${{ env.resourceGroupName }} \
+              --template-file ${{ env.templateFile }} \
+              --parameters baseName=${{ env.baseName }} \
+              --parameters imageName=${{ env.imageName }} \
+              --parameters addAzureAdAppSettings=${{ env.addAzureAdAppSettings }}
+        shell: bash
+  BuildAndPush-BuildImage:
+    name: Build and push an image to container registry
+    needs:
+      - deployInfra-deploy
+    runs-on: ubuntu-latest
+    if: success() && ${{ github.event.inputs.teardown == 'false' }}
+    permissions:
+      id-token: write # This is required for requesting the JWT to login to Azure with GitHub Actions and federate identity
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Azure Login to ${{ env.azureSubscription }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Get container registry Name ${{ env.azureSubscription }}
+        run: |-
+          echo "Getting container registry"
+          containerRegistryName=$(az deployment group show --name ${{ env.deploymentName }} \
+            --resource-group ${{ env.resourceGroupName }} \
+            --query properties.outputs.containerRegistryName.value \
+            -o tsv)
+          echo "Container Registry: $containerRegistryName"
+          # set output variable to environment variable
+          echo "containerRegistryName=$containerRegistryName" >> $GITHUB_ENV
+        shell: bash
+        working-directory: "${{ env.workingDirectory }}"
+      - name: Display Container Registry Name
+        run: echo ${{ env.containerRegistryName }}
+      - name: Azure Login to ${{ env.azureSubscription }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Build and push image ${{ env.azureSubscription }}
+        run: |-
+          echo "Building and pushing image to container registry"
+          az acr build --registry ${{ env.containerRegistryName }} \
+            --image ${{ env.imageName }}:${{ github.run_id }} \
+            --image ${{ env.imageName }}:latest \
+            --file ${{ env.dockerfilePath }} \
+            ${{ env.workingDirectoryDockerContext }}
+        shell: bash
+  Teardown-Teardown:
+    name: Teardown infrastructure
+    needs: []
+    runs-on: ubuntu-latest
+    environment:
+      name: "${{ inputs.environmentName }}-${{ inputs.instanceNumber }}_DESTROYED"
+    if: ${{ github.event.inputs.teardown == 'true' }}
+    permissions:
+      id-token: write # This is required for requesting the JWT to login to Azure with GitHub Actions and federate identity
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        name: Sign in to Azure with OIDC
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Delete Resource Group ${{ env.resourceGroupName }} if exist
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            if [[ $(az group exists -n ${{ env.resourceGroupName }}) == true ]]
+            then
+              echo "Resource group exists. Deleting..."
+              az group delete -n ${{ env.resourceGroupName }} --yes
+            else
+              echo "Resource group does not exist in the subscription. Nothing to delete."
+            fi

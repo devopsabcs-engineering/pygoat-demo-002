@@ -1,0 +1,229 @@
+trigger:
+  batch: true
+  branches:
+    include:
+      - master # main
+    exclude:
+      - features/experimental/*
+  paths:
+    exclude:
+      - README.md
+    include:
+      # include app files
+      - Dockerfile
+      # include pipeline file
+      - .azuredevops/pipelines/main-ci-cd.yml
+      # include infra files
+      - infra/bicep/appservice/main.bicep
+
+pool:
+  vmImage: "ubuntu-latest"
+
+parameters:
+  - name: deployInfra
+    type: boolean
+    default: true
+  - name: subscriptionName
+    type: string
+    default: "OWASP_IT Test" # Change to your Azure subscription name
+  - name: baseName
+    type: string
+    default: pygoat
+  - name: imageName
+    type: string
+    default: pygoat
+  - name: location
+    type: string
+    values:
+      - canadaeast
+      - canadacentral
+      - eastus2
+      - westus2
+      - centralus
+      - northeurope
+      - westeurope
+      - southeastasia
+      - eastasia
+    default: canadacentral
+  - name: environmentName
+    type: string
+    values:
+      - dev
+      - test
+      - prod
+    default: dev
+  - name: instanceNumber
+    type: string
+    default: 006
+  - name: teardown
+    displayName: Should teardown infrastructure?
+    type: boolean
+    default: false
+
+variables:
+  - name: azureSubscription
+    value: ${{ parameters.subscriptionName }}
+  - name: resourceGroupName
+    value: rg-${{ parameters.baseName }}-${{ parameters.environmentName }}-${{ parameters.instanceNumber }}
+  - name: location
+    value: ${{ parameters.location }}
+  - name: deploymentName
+    value: infra-deployment
+  - name: templateFile
+    value: $(System.DefaultWorkingDirectory)/infra/bicep/appservice/main.bicep
+  - name: baseName
+    value: ${{ parameters.baseName }}-${{ parameters.environmentName }}-${{ parameters.instanceNumber }}
+  - name: imageName
+    value: ${{ parameters.imageName }}
+  - name: deployInfra
+    value: ${{ parameters.deployInfra }}
+  - name: workingDirectory
+    value: "$(System.DefaultWorkingDirectory)"
+  - name: workingDirectoryDockerContext
+    value: "$(System.DefaultWorkingDirectory)"
+  - name: dockerfilePath
+    value: "$(System.DefaultWorkingDirectory)/Dockerfile"
+  - name: environmentName
+    value: OWASP_${{ parameters.baseName }}_${{ parameters.environmentName }}_${{ parameters.instanceNumber }}
+  - name: addAzureAdAppSettings
+    value: false
+
+stages:
+  - stage: set_version
+    displayName: Set version and create tag
+    condition: eq('${{ parameters.teardown }}', false)
+    jobs:
+      - job: set_version
+        displayName: Set version
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+          - task: gitversion/setup@3
+            enabled: true
+            displayName: "Install GitTools"
+            inputs:
+              versionSpec: "5.x"
+          - task: gitversion/execute@3
+            enabled: true
+            displayName: "Calculate SemVer"
+          - script: echo current version is $(GitVersion.SemVer)
+            displayName: "Display calculated version"
+          - task: CmdLine@2
+            enabled: true
+            displayName: Init git global config
+            inputs:
+              script: |
+                git config --global user.email $(Build.RequestedForEmail)
+                git config --global user.name $(Build.RequestedFor)
+          - task: CmdLine@2
+            enabled: true
+            displayName: Create Git tag for current version
+            inputs:
+              script: |
+                git tag -a $(GitVersion.SemVer) -m "Main version $(GitVersion.SemVer)"
+                git push origin $(GitVersion.SemVer)
+  - stage: deployInfra
+    displayName: Deploy Infra
+    dependsOn: set_version
+    condition: and(succeeded(), eq(variables['deployInfra'], true), eq('${{ parameters.teardown }}', false))
+    jobs:
+      - deployment: deploy
+        displayName: Deploy Infra job
+        environment: ${{ variables.environmentName }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                # azure cli
+                - task: AzureCLI@2
+                  displayName: "Azure CLI Login $(azureSubscription) - deployInfra"
+                  inputs:
+                    azureSubscription: "$(azureSubscription)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      echo "Deploying to Azure"
+                      az group create --name $(resourceGroupName) \
+                          --location $(location)
+
+                      az deployment group create --name $(deploymentName) \
+                          --resource-group $(resourceGroupName) \
+                          --template-file $(templateFile) \
+                          --parameters baseName=$(baseName) \
+                          --parameters imageName=$(imageName) \
+                          --parameters addAzureAdAppSettings=$(addAzureAdAppSettings)
+  - stage: BuildAndPush
+    displayName: Build and push stage
+    dependsOn: deployInfra
+    condition: and(succeeded(), eq('${{ parameters.teardown }}', false))
+    jobs:
+      - job: BuildImage
+        displayName: Build and push an image to container registry
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+          - task: gitversion/setup@3
+            enabled: true
+            displayName: "Install GitTools"
+            inputs:
+              versionSpec: "5.x"
+          - task: gitversion/execute@3
+            enabled: true
+            displayName: "Calculate SemVer"
+          - script: echo current version is $(GitVersion.SemVer)
+            displayName: "Display calculated version"
+          # get container registry from azure deployment with azure cli
+          - task: AzureCLI@2
+            displayName: "Get container registry $(azureSubscription)"
+            name: get_container_registry
+            inputs:
+              azureSubscription: "$(azureSubscription)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Getting container registry"
+                containerRegistryName=$(az deployment group show --name $(deploymentName) \
+                  --resource-group $(resourceGroupName) \
+                  --query properties.outputs.containerRegistryName.value \
+                  -o tsv)
+                echo "Container Registry: $containerRegistryName"
+                echo "##vso[task.setvariable variable=containerRegistry;isOutput=true]$containerRegistryName"
+              workingDirectory: "$(workingDirectory)"
+          # echo container registry
+          - script: echo $(get_container_registry.containerRegistry)
+            displayName: "Container Registry"
+          # build and push image to container registry via azure cli
+          - task: AzureCLI@2
+            displayName: "Build and push image $(azureSubscription)"
+            inputs:
+              azureSubscription: "$(azureSubscription)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Building and pushing image to container registry"                
+                az acr build --registry $(get_container_registry.containerRegistry) \
+                  --image $(imageName):$(Build.BuildId) \
+                  --image $(imageName):latest \
+                  --file $(dockerfilePath) \
+                  $(workingDirectoryDockerContext)
+  - stage: Teardown
+    displayName: Teardown infrastructure
+    dependsOn: []
+    condition: eq('${{ parameters.teardown }}', true)
+    jobs:
+      - deployment: Teardown
+        displayName: Teardown infrastructure
+        environment: ${{ variables.environmentName }}_DESTROYED
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureResourceManagerTemplateDeployment@3
+                  inputs:
+                    deploymentScope: "Resource Group"
+                    azureResourceManagerConnection: $(azureSubscription)
+                    action: "DeleteRG"
+                    resourceGroupName: $(resourceGroupName)
