@@ -45,7 +45,7 @@ on:
 
 env:
   ZAP_TARGET: "http://127.0.0.1:8080/" # Change this to your target URL
-  buildAndStart: "false" # Change to "true" to build and start the application if not running
+  buildAndStart: "true" # Change to "true" to build and start the application if not running
   imageName: "localbuild/testimage"
   tag: "latest"
   HOST_PORT: "8080"
